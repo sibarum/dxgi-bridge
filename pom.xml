@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>sibarum.dxgi</groupId>
+    <artifactId>dxgi-bridge</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+
+    <name>dxgi-bridge</name>
+    <description>
+        Present Vulkan-drawn images through a DXGI swapchain on Windows: D3D12 and DXGI over Panama FFM, and the
+        Vulkan side of sharing an image and a fence with them. Windows only; depends on nothing but supirvast.
+    </description>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <supirvast.version>0.2.0-SNAPSHOT</supirvast.version>
+        <junit.version>5.11.4</junit.version>
+    </properties>
+
+    <dependencies>
+        <!-- Ffi (the only door to the Linker) and NativeException. -->
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir-ffi</artifactId>
+            <version>${supirvast.version}</version>
+        </dependency>
+        <!-- VulkanDevice, VulkanInstance and the structs the Vulkan half of the sharing is written in. -->
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir-vulkan</artifactId>
+            <version>${supirvast.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+                <configuration>
+                    <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
