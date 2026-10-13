@@ -3,10 +3,11 @@
 Present Vulkan-drawn images through a **DXGI swapchain** on Windows, from Java, over Panama FFM.
 
 Vulkan keeps doing all the drawing. It draws into one image that D3D12 created and shared; a D3D12 queue copies
-the visible part of it into a flip-model DXGI swapchain and presents. Windows owns that swapchain, so a window
-resize is `IDXGISwapChain::ResizeBuffers` — not a `vkCreateSwapchainKHR`, which on some machines (a hybrid
-laptop, notably) stalls the compositor for seconds or resets the GPU when it happens dozens of times a second
-during a drag.
+the visible part of it into a flip-model DXGI swapchain and presents. The swapchain's back buffers, like the image,
+are larger than the window and presented unscaled, so a window resize normally reallocates nothing: neither a
+`vkCreateSwapchainKHR` nor an `IDXGISwapChain::ResizeBuffers`. Either one, dozens of times a second during a drag,
+on a hybrid laptop whose panel is driven by the other GPU, stalls for seconds at a time or hangs the GPU until it is
+reset; `ResizeBuffers` happens only when the window outgrows the buffers.
 
 The design follows [vk_dxgi](https://github.com/something-mighty/vk_dxgi) (CC0), in its blit mode.
 

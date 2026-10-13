@@ -12,8 +12,19 @@ import java.lang.foreign.MemorySegment;
  * ({@link #ensureCapacity}), draw into {@link #image()} in Vulkan — waiting on {@link #lastCopyValue()} before
  * writing, signalling a value from {@link DxgiContext#nextValue()} when done — then {@link #present} with that value.
  *
- * <p>The image is allocated larger than the window and only reallocated when the window outgrows it, so a
- * {@link #resize} is a {@code ResizeBuffers} and nothing else: no Vulkan object changes.
+ * <p>The image and the back buffers are both allocated larger than the window and only reallocated when the window
+ * outgrows them, so a {@link #resize} normally changes nothing at all: no buffer on either GPU and no Vulkan object.
+ * The buffers are presented unscaled ({@code DXGI_SCALING_NONE}), so the compositor shows their top-left 1:1 and the
+ * window's edge clips the rest, and {@link #present} fills exactly that corner.
+ *
+ * <p>{@code ResizeBuffers} on every size change is what made a drag hang: on a machine whose panel is driven by
+ * another GPU than the one drawing, each call reallocates the cross-adapter surfaces on both, and the driver every so
+ * often held one for a round 1, 2 or 10 s, or hung the GPU until it was reset (measured 2026-10-13, MainFrame on an
+ * RTX 5070 Ti laptop whose panel is on the Intel GPU: 300 resizes stalled 1-7 s at a time and raised a GPU engine
+ * timeout; without the reallocation, 300 took 9 s and none waited over 70 ms). A Vulkan swapchain's rebuild did the
+ * same, for the same reason. {@code SetSourceSize} looks like the tool for this and is not: on that machine the
+ * compositor ignored it under {@code SCALING_STRETCH} and scaled the source up to the buffer under
+ * {@code SCALING_NONE}.
  */
 public final class DxgiSwapchain implements AutoCloseable {
 
@@ -32,30 +43,38 @@ public final class DxgiSwapchain implements AutoCloseable {
     private final MemorySegment[] allocators = new MemorySegment[BUFFERS];
     private final MemorySegment[] lists = new MemorySegment[BUFFERS];
     private final long[] bufferDone = new long[BUFFERS];
+    /** The window's size: the part of the back buffers on the screen. */
     private int width;
     private int height;
+    /** The back buffers' allocated size, at least {@link #width}×{@link #height}. */
+    private int bufferWidth;
+    private int bufferHeight;
     private SharedImage image;
     private long lastCopy;
     private boolean closed;
 
-    private DxgiSwapchain(DxgiContext context, MemorySegment swapchain, MemorySegment waitable, int width, int height) {
+    private DxgiSwapchain(DxgiContext context, MemorySegment swapchain, MemorySegment waitable, int width, int height,
+                          int bufferWidth, int bufferHeight) {
         this.context = context;
         this.swapchain = swapchain;
         this.waitable = waitable;
         this.width = width;
         this.height = height;
+        this.bufferWidth = bufferWidth;
+        this.bufferHeight = bufferHeight;
     }
 
     /**
-     * A swapchain on {@code hwnd}, {@code width}×{@code height}. {@code stretch} picks what the compositor does
-     * with a back buffer that does not match the window between a resize and the next present: stretch it, or
-     * show it 1:1 at the top-left.
+     * A swapchain on {@code hwnd}, {@code width}×{@code height}. Between a resize and the next present the compositor
+     * shows the last frame 1:1 at the top-left; it is never stretched, since the buffers are larger than the window.
      */
-    public static DxgiSwapchain create(DxgiContext context, MemorySegment hwnd, int width, int height, boolean stretch) {
+    public static DxgiSwapchain create(DxgiContext context, MemorySegment hwnd, int width, int height) {
         int w = Math.max(1, width);
         int h = Math.max(1, height);
-        MemorySegment swapchain = Dxgi.createSwapChainForHwnd(context.factory(), context.queue(), hwnd, w, h,
-                Dxgi.FORMAT_B8G8R8A8_UNORM, BUFFERS, stretch ? Dxgi.SCALING_STRETCH : Dxgi.SCALING_NONE, FLAGS);
+        int bufferW = capacity(w);
+        int bufferH = capacity(h);
+        MemorySegment swapchain = Dxgi.createSwapChainForHwnd(context.factory(), context.queue(), hwnd, bufferW, bufferH,
+                Dxgi.FORMAT_B8G8R8A8_UNORM, BUFFERS, Dxgi.SCALING_NONE, FLAGS);
         DxgiSwapchain made = null;
         try {
             Dxgi.makeWindowAssociation(context.factory(), hwnd, Dxgi.MWA_NO_WINDOW_CHANGES | Dxgi.MWA_NO_ALT_ENTER);
@@ -63,7 +82,7 @@ public final class DxgiSwapchain implements AutoCloseable {
             // Vulkan path keeps with one frame in flight.
             Dxgi.setMaximumFrameLatency(swapchain, 1);
             MemorySegment waitable = Dxgi.frameLatencyWaitable(swapchain);
-            made = new DxgiSwapchain(context, swapchain, waitable, w, h);
+            made = new DxgiSwapchain(context, swapchain, waitable, w, h, bufferW, bufferH);
             for (int i = 0; i < BUFFERS; i++) {
                 made.allocators[i] = D3d12.createCommandAllocator(context.device());
                 made.lists[i] = D3d12.createCommandList(context.device(), made.allocators[i]);
@@ -98,7 +117,7 @@ public final class DxgiSwapchain implements AutoCloseable {
         return lastCopy;
     }
 
-    /** The back buffers' size: what was last presented at, or resized to. */
+    /** The window's size as last presented at, or resized to: the part of the back buffers on the screen. */
     public int width() {
         return width;
     }
@@ -142,8 +161,10 @@ public final class DxgiSwapchain implements AutoCloseable {
     }
 
     /**
-     * Resize the back buffers to {@code w}×{@code h} — the whole cost of a window resize on this path. Idles the
-     * D3D12 queue (no back buffer may be in use); does nothing if the size is unchanged.
+     * Present {@code w}×{@code h} from now on — the whole cost of a window resize on this path. Within the back
+     * buffers' capacity that is a new pair of numbers and nothing else; only a window that outgrows them idles the
+     * D3D12 queue (no back buffer may be in use) and reallocates them with headroom, which a drag does rarely. Does
+     * nothing if the size is unchanged.
      */
     public void resize(int w, int h) {
         w = Math.max(1, w);
@@ -151,8 +172,14 @@ public final class DxgiSwapchain implements AutoCloseable {
         if (w == width && h == height) {
             return;
         }
-        context.idle();
-        Dxgi.resizeBuffers(swapchain, w, h, FLAGS);
+        if (w > bufferWidth || h > bufferHeight) {
+            int bufferW = capacity(Math.max(w, bufferWidth));
+            int bufferH = capacity(Math.max(h, bufferHeight));
+            context.idle();
+            Dxgi.resizeBuffers(swapchain, bufferW, bufferH, FLAGS);
+            bufferWidth = bufferW;
+            bufferHeight = bufferH;
+        }
         width = w;
         height = h;
     }

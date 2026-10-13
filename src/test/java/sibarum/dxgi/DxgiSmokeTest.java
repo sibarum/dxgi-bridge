@@ -62,7 +62,7 @@ class DxgiSmokeTest {
             try (VulkanDevice device = new VulkanDevice(instance.handle(), selection.get(), request);
                  DxgiContext context = DxgiContext.create(instance, device)) {
                 Clearer clearer = new Clearer(device);
-                try (DxgiSwapchain swapchain = DxgiSwapchain.create(context, hwnd, 640, 480, true)) {
+                try (DxgiSwapchain swapchain = DxgiSwapchain.create(context, hwnd, 640, 480)) {
                     int w = 640;
                     int h = 480;
                     for (int frame = 0; frame < 6; frame++) {
