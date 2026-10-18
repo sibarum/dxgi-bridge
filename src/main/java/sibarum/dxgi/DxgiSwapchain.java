@@ -9,8 +9,16 @@ import java.lang.foreign.MemorySegment;
  * A flip-model DXGI swapchain on one window, and the shared image Vulkan draws that window into.
  *
  * <p>A frame: {@link #beginFrame} (the swapchain can take another), make sure the image is big enough
- * ({@link #ensureCapacity}), draw into {@link #image()} in Vulkan — waiting on {@link #lastCopyValue()} before
- * writing, signalling a value from {@link DxgiContext#nextValue()} when done — then {@link #present} with that value.
+ * ({@link #ensureCapacity}), draw into {@link #image()} in Vulkan and {@link #recordCopyOut} after the drawing, in the
+ * same submission — waiting on {@link #lastCopyValue()} before writing, signalling a value from
+ * {@link DxgiContext#nextValue()} when done — then {@link #present} with that value.
+ *
+ * <p>Where the frame crosses to D3D12 is {@link DxgiContext#sharesBuffer()}'s choice. Normally {@link #image()} is
+ * itself shared: Vulkan draws into the memory D3D12 copies from, and {@link #recordCopyOut} records nothing. On a
+ * driver that cannot draw into a shared image (dzn: {@link DxgiContext#needsBuffer}) the image is Vulkan's own, a
+ * shared <em>buffer</em> sits beside it, {@link #recordCopyOut} copies the drawn corner into the buffer, and
+ * {@link #present} copies the buffer's placed footprint into the back buffer. That is one more copy of the window's
+ * pixels per frame, on the GPU.
  *
  * <p>The image and the back buffers are both allocated larger than the window and only reallocated when the window
  * outgrows them, so a {@link #resize} normally changes nothing at all: no buffer on either GPU and no Vulkan object.
@@ -50,6 +58,8 @@ public final class DxgiSwapchain implements AutoCloseable {
     private int bufferWidth;
     private int bufferHeight;
     private SharedImage image;
+    /** The buffer the frame crosses to D3D12 through, when {@link DxgiContext#sharesBuffer()}; null otherwise. */
+    private SharedBuffer shared;
     private long lastCopy;
     private boolean closed;
 
@@ -139,6 +149,11 @@ public final class DxgiSwapchain implements AutoCloseable {
         int capH = capacity(Math.max(h, image == null ? 0 : image.height()));
         context.idle();
         releaseImage();
+        if (context.sharesBuffer()) {
+            image = context.interop().createImage(capW, capH, Vk.FORMAT_B8G8R8A8_UNORM, IMAGE_USAGE);
+            shared = importBuffer(capW, capH);
+            return true;
+        }
         MemorySegment resource = D3d12.createSharedTexture(context.device(), capW, capH, Dxgi.FORMAT_B8G8R8A8_UNORM);
         try {
             MemorySegment handle = D3d12.createSharedHandle(context.device(), resource);
@@ -153,6 +168,42 @@ public final class DxgiSwapchain implements AutoCloseable {
             throw e;
         }
         return true;
+    }
+
+    /** A shared buffer holding a {@code w}×{@code h} BGRA image, rows aligned for a D3D12 placed footprint. */
+    private SharedBuffer importBuffer(int w, int h) {
+        int align = D3d12.TEXTURE_DATA_PITCH_ALIGNMENT;
+        int rowPitch = (w * 4 + align - 1) / align * align;
+        MemorySegment resource = D3d12.createSharedBuffer(context.device(), (long) rowPitch * h);
+        try {
+            MemorySegment handle = D3d12.createSharedHandle(context.device(), resource);
+            try {
+                return context.interop().importBuffer(resource, handle, rowPitch, w, h,
+                        Vk.BUFFER_USAGE_TRANSFER_DST_BIT);
+            } finally {
+                Win32.close(handle);
+            }
+        } catch (RuntimeException e) {
+            Com.release(resource);
+            throw e;
+        }
+    }
+
+    /**
+     * Record, after the drawing into {@link #image()} and in the same command buffer, whatever hands its top-left
+     * {@code w}×{@code h} to D3D12: nothing when the image is itself shared, a copy into the shared buffer when not.
+     * The image is in {@code layout} (which must allow transfer reads), last written at {@code srcStage} with
+     * {@code srcAccess}, and stays in that layout.
+     */
+    public void recordCopyOut(MemorySegment cmd, int layout, int srcStage, int srcAccess, int w, int h) {
+        if (shared == null) {
+            return;
+        }
+        int copyW = Math.min(w, shared.width());
+        int copyH = Math.min(h, shared.height());
+        if (copyW > 0 && copyH > 0) {
+            context.interop().recordCopyToBuffer(cmd, image, layout, srcStage, srcAccess, shared, copyW, copyH);
+        }
     }
 
     private static int capacity(int size) {
@@ -203,7 +254,10 @@ public final class DxgiSwapchain implements AutoCloseable {
         MemorySegment backBuffer = Dxgi.buffer(swapchain, index);
         try {
             D3d12.transition(list, backBuffer, D3d12.RESOURCE_STATE_PRESENT, D3d12.RESOURCE_STATE_COPY_DEST);
-            if (copyW > 0 && copyH > 0) {
+            if (copyW > 0 && copyH > 0 && shared != null) {
+                D3d12.copyFootprintCorner(list, backBuffer, shared.d3dResource(), Dxgi.FORMAT_B8G8R8A8_UNORM,
+                        copyW, copyH, shared.rowPitch());
+            } else if (copyW > 0 && copyH > 0) {
                 D3d12.copyCorner(list, backBuffer, image.d3dResource(), copyW, copyH);
             }
             D3d12.transition(list, backBuffer, D3d12.RESOURCE_STATE_COPY_DEST, D3d12.RESOURCE_STATE_PRESENT);
@@ -232,6 +286,11 @@ public final class DxgiSwapchain implements AutoCloseable {
             context.interop().destroy(image);
             Com.release(image.d3dResource());
             image = null;
+        }
+        if (shared != null) {
+            context.interop().destroy(shared);
+            Com.release(shared.d3dResource());
+            shared = null;
         }
     }
 

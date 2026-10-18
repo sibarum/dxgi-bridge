@@ -39,7 +39,11 @@ public final class D3d12 {
     public static final int COMMAND_LIST_TYPE_DIRECT = 0;
     public static final int HEAP_TYPE_DEFAULT = 1;
     public static final int HEAP_FLAG_SHARED = 0x1;
+    public static final int RESOURCE_DIMENSION_BUFFER = 1;
     public static final int RESOURCE_DIMENSION_TEXTURE2D = 3;
+    public static final int TEXTURE_LAYOUT_ROW_MAJOR = 1;
+    /** {@code D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}: a placed footprint's rows start a multiple of this many bytes apart. */
+    public static final int TEXTURE_DATA_PITCH_ALIGNMENT = 256;
     public static final int RESOURCE_FLAG_ALLOW_RENDER_TARGET = 0x1;
     public static final int RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS = 0x20;
     public static final int RESOURCE_STATE_COMMON = 0;
@@ -53,6 +57,7 @@ public final class D3d12 {
     private static final int BARRIER_TYPE_TRANSITION = 0;
     private static final int BARRIER_ALL_SUBRESOURCES = 0xffffffff;
     private static final int COPY_TYPE_SUBRESOURCE_INDEX = 0;
+    private static final int COPY_TYPE_PLACED_FOOTPRINT = 1;
 
     // ID3D12DeviceVtbl
     private static final int DEVICE_CREATE_COMMAND_QUEUE = 8;
@@ -113,6 +118,17 @@ public final class D3d12 {
             ADDRESS.withName("pResource"), JAVA_INT.withName("Type"), MemoryLayout.paddingLayout(4),
             JAVA_INT.withName("SubresourceIndex"), MemoryLayout.paddingLayout(28)
     ).withName("D3D12_TEXTURE_COPY_LOCATION");
+
+    /**
+     * {@code D3D12_TEXTURE_COPY_LOCATION} with its placed-footprint member: the same 48 bytes, the footprint's
+     * {@code UINT64 Offset} at 16 and its {@code D3D12_SUBRESOURCE_FOOTPRINT} after it.
+     */
+    private static final GroupLayout FOOTPRINT_COPY_LOCATION = MemoryLayout.structLayout(
+            ADDRESS.withName("pResource"), JAVA_INT.withName("Type"), MemoryLayout.paddingLayout(4),
+            JAVA_LONG.withName("Offset"), JAVA_INT.withName("Format"), JAVA_INT.withName("Width"),
+            JAVA_INT.withName("Height"), JAVA_INT.withName("Depth"), JAVA_INT.withName("RowPitch"),
+            MemoryLayout.paddingLayout(4)
+    ).withName("D3D12_TEXTURE_COPY_LOCATION(footprint)");
 
     /** {@code D3D12_BOX}. */
     private static final GroupLayout BOX = MemoryLayout.structLayout(
@@ -253,6 +269,36 @@ public final class D3d12 {
         }
     }
 
+    /**
+     * A buffer of {@code size} bytes on a shared default heap: what Vulkan copies a frame into, rows
+     * {@link #TEXTURE_DATA_PITCH_ALIGNMENT}-aligned, for this queue to copy out of as a placed footprint. A buffer has
+     * no layout, so no barrier either API records on it can name a wrong one (see {@link DxgiSwapchain}). Created
+     * {@code COMMON}; a buffer is promoted to a copy source implicitly and decays back.
+     */
+    public static MemorySegment createSharedBuffer(MemorySegment device, long size) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment heap = temp.allocate(HEAP_PROPERTIES);
+            heap.set(JAVA_INT, HEAP_PROPERTIES.byteOffset(MemoryLayout.PathElement.groupElement("Type")),
+                    HEAP_TYPE_DEFAULT);
+            MemorySegment desc = temp.allocate(RESOURCE_DESC);
+            set(desc, RESOURCE_DESC, "Dimension", RESOURCE_DIMENSION_BUFFER);
+            desc.set(JAVA_LONG, off(RESOURCE_DESC, "Width"), size);
+            set(desc, RESOURCE_DESC, "Height", 1);
+            desc.set(JAVA_SHORT, off(RESOURCE_DESC, "DepthOrArraySize"), (short) 1);
+            desc.set(JAVA_SHORT, off(RESOURCE_DESC, "MipLevels"), (short) 1);
+            set(desc, RESOURCE_DESC, "SampleCount", 1);
+            set(desc, RESOURCE_DESC, "Layout", TEXTURE_LAYOUT_ROW_MAJOR);
+            MemorySegment out = temp.allocate(ADDRESS);
+            int hr = (int) Com.method(device, DEVICE_CREATE_COMMITTED_RESOURCE, CREATE_COMMITTED_RESOURCE)
+                    .invokeExact(device, heap, HEAP_FLAG_SHARED, desc, RESOURCE_STATE_COMMON, MemorySegment.NULL,
+                            IID_RESOURCE, out);
+            Com.check(hr, "ID3D12Device::CreateCommittedResource(buffer)");
+            return out.get(ADDRESS, 0);
+        } catch (Throwable t) {
+            throw NativeException.rethrow("ID3D12Device::CreateCommittedResource(buffer)", t);
+        }
+    }
+
     /** A fence starting at {@code initial}. */
     public static MemorySegment createFence(MemorySegment device, long initial, int flags) {
         try (Arena temp = Arena.ofConfined()) {
@@ -385,6 +431,31 @@ public final class D3d12 {
             Com.method(list, LIST_COPY_TEXTURE_REGION, COPY_TEXTURE_REGION).invokeExact(list, dst, 0, 0, 0, src, box);
         } catch (Throwable t) {
             throw NativeException.rethrow("ID3D12GraphicsCommandList::CopyTextureRegion", t);
+        }
+    }
+
+    /**
+     * Record a copy of a {@code width}×{@code height} image of {@code dxgiFormat}, laid out in {@code buffer} from
+     * offset 0 with rows {@code rowPitch} bytes apart, into the top-left of {@code dest}.
+     */
+    public static void copyFootprintCorner(MemorySegment list, MemorySegment dest, MemorySegment buffer,
+                                           int dxgiFormat, int width, int height, int rowPitch) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment dst = temp.allocate(TEXTURE_COPY_LOCATION);
+            dst.set(ADDRESS, 0, dest);
+            set(dst, TEXTURE_COPY_LOCATION, "Type", COPY_TYPE_SUBRESOURCE_INDEX);
+            MemorySegment src = temp.allocate(FOOTPRINT_COPY_LOCATION);
+            src.set(ADDRESS, 0, buffer);
+            set(src, FOOTPRINT_COPY_LOCATION, "Type", COPY_TYPE_PLACED_FOOTPRINT);
+            set(src, FOOTPRINT_COPY_LOCATION, "Format", dxgiFormat);
+            set(src, FOOTPRINT_COPY_LOCATION, "Width", width);
+            set(src, FOOTPRINT_COPY_LOCATION, "Height", height);
+            set(src, FOOTPRINT_COPY_LOCATION, "Depth", 1);
+            set(src, FOOTPRINT_COPY_LOCATION, "RowPitch", rowPitch);
+            Com.method(list, LIST_COPY_TEXTURE_REGION, COPY_TEXTURE_REGION)
+                    .invokeExact(list, dst, 0, 0, 0, src, MemorySegment.NULL);
+        } catch (Throwable t) {
+            throw NativeException.rethrow("ID3D12GraphicsCommandList::CopyTextureRegion(footprint)", t);
         }
     }
 

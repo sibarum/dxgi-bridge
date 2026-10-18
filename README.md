@@ -17,6 +17,13 @@ The design follows [vk_dxgi](https://github.com/something-mighty/vk_dxgi) (CC0),
 - **One shared image** (`D3D12_HEAP_FLAG_SHARED`, render target, simultaneous access), imported into Vulkan with
   `VK_KHR_external_memory_win32` as a `D3D12_RESOURCE` handle. It is allocated larger than the window and only
   reallocated when the window outgrows it, so a resize normally changes nothing on the Vulkan side.
+- **Or one shared buffer, on dzn.** Mesa's Vulkan-over-D3D12 driver cannot draw into a shared image (it emits barrier
+  layouts D3D12 refuses on a simultaneous-access texture, and the first `vkEndCommandBuffer` fails). There, chosen by
+  `VkPhysicalDeviceDriverProperties.driverID`, Vulkan draws into an image of its own, copies the window's corner into
+  a shared buffer at a 256-byte row pitch (`DxgiSwapchain.recordCopyOut`), and D3D12 copies that placed footprint into
+  the back buffer. `-Ddxgi.share=buffer|image` overrides the choice. On an RTX 5070 Ti's own driver the extra copy cost
+  about 25-80 µs a frame up to 1080p and about 200 µs at 4K (`DxgiShareCostBench`), which is why it is not used
+  everywhere.
 - **One fence.** A D3D12 fence created `D3D12_FENCE_FLAG_SHARED`, imported into Vulkan as a **timeline
   semaphore** (`VK_KHR_external_semaphore_win32`, `D3D12_FENCE` handle). Every value on it is handed out by
   `DxgiContext.nextValue()`, so both APIs count on the same line.

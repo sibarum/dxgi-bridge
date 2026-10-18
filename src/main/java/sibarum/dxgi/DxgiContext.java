@@ -23,6 +23,12 @@ public final class DxgiContext implements AutoCloseable {
     /** {@code -Ddxgi.debug=true}: the D3D12 debug layer and a debug DXGI factory. */
     public static final boolean DEBUG = Boolean.getBoolean("dxgi.debug");
 
+    /**
+     * {@code -Ddxgi.share=image|buffer}: what Vulkan hands D3D12 a frame through, overriding {@link #sharesBuffer}'s
+     * choice by driver. For measuring one path on a driver that would take the other.
+     */
+    public static final String SHARE = System.getProperty("dxgi.share", "");
+
     /** How long a CPU wait on the fence may take before the device is presumed gone. */
     private static final int WAIT_MILLIS = 5_000;
 
@@ -34,11 +40,14 @@ public final class DxgiContext implements AutoCloseable {
     private final MemorySegment fence;
     private final MemorySegment event;
     private final long timeline;
+    private final boolean sharesBuffer;
     private long value;
     private boolean closed;
 
     private DxgiContext(VkInterop interop, MemorySegment factory, MemorySegment adapter, MemorySegment device,
-                        MemorySegment queue, MemorySegment fence, MemorySegment event, long timeline) {
+                        MemorySegment queue, MemorySegment fence, MemorySegment event, long timeline,
+                        boolean sharesBuffer) {
+        this.sharesBuffer = sharesBuffer;
         this.interop = interop;
         this.factory = factory;
         this.adapter = adapter;
@@ -51,9 +60,32 @@ public final class DxgiContext implements AutoCloseable {
 
     /**
      * The D3D12 side of {@code vulkan}, which must have been made with {@link #REQUIRED_DEVICE_EXTENSIONS} and
-     * timeline semaphores. Fails if the driver reports no adapter LUID for the device.
+     * timeline semaphores. Fails if the driver reports no adapter LUID for the device. Shares a buffer rather than
+     * an image when the driver needs it ({@link #needsBuffer}) or {@link #SHARE} says so.
      */
     public static DxgiContext create(VulkanInstance instance, VulkanDevice vulkan) {
+        boolean buffer = SHARE.equals("buffer") || (!SHARE.equals("image") && needsBuffer(instance, vulkan));
+        return create(instance, vulkan, buffer);
+    }
+
+    /**
+     * Whether {@code vulkan}'s driver cannot draw into an image shared with D3D12, so a frame must reach D3D12
+     * through a buffer: true on Mesa's dzn (Vulkan over D3D12). dzn makes the exported image a simultaneous-access
+     * texture, then translates a render pass's layout transitions on it into D3D12 barrier layouts such a texture may
+     * not have ({@code RENDER_TARGET}, or {@code DIRECT_QUEUE_COMMON} when drawn in {@code GENERAL}); D3D12 refuses
+     * them (debug layer #1334, {@code INCOMPATIBLE_BARRIER_LAYOUT}), the command list will not close, and the first
+     * frame's {@code vkEndCommandBuffer} fails with -1. A buffer has no layout. Seen 2026-10-17 with the
+     * Compatibility Pack's dzn 1.2608.3.0, on WARP and on an RTX 5070 Ti.
+     */
+    public static boolean needsBuffer(VulkanInstance instance, VulkanDevice vulkan) {
+        return VkInterop.driverId(instance, vulkan.physicalDevice()) == VkInterop.DRIVER_ID_MESA_DOZEN;
+    }
+
+    /**
+     * As {@link #create(VulkanInstance, VulkanDevice)}, with the choice made: {@code sharesBuffer} hands each frame to
+     * D3D12 through a shared buffer that Vulkan copies the drawn image into, instead of drawing into a shared image.
+     */
+    public static DxgiContext create(VulkanInstance instance, VulkanDevice vulkan, boolean sharesBuffer) {
         VkInterop.requireExtensions(vulkan);
         long luid = instance.adapterLuid(vulkan.physicalDevice()).orElseThrow(() ->
                 new NativeException("the Vulkan device reports no adapter LUID, so DXGI cannot find the same GPU"));
@@ -81,7 +113,7 @@ public final class DxgiContext implements AutoCloseable {
             } finally {
                 Win32.close(handle);
             }
-            return new DxgiContext(interop, factory, adapter, device, queue, fence, event, timeline);
+            return new DxgiContext(interop, factory, adapter, device, queue, fence, event, timeline, sharesBuffer);
         } catch (RuntimeException e) {
             Win32.close(event);
             Com.release(fence);
@@ -91,6 +123,14 @@ public final class DxgiContext implements AutoCloseable {
             Com.release(factory);
             throw e;
         }
+    }
+
+    /**
+     * Whether a frame reaches D3D12 through a shared buffer (Vulkan draws into a private image and copies it there)
+     * rather than by drawing straight into a shared image. See {@link DxgiSwapchain#recordCopyOut}.
+     */
+    public boolean sharesBuffer() {
+        return sharesBuffer;
     }
 
     /** The next value on the shared fence; nothing else hands one out. */

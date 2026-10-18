@@ -18,6 +18,7 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.BiFunction;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
@@ -45,8 +46,21 @@ class DxgiSmokeTest {
             JAVA_INT.withName("baseArrayLayer"), JAVA_INT.withName("layerCount"), MemoryLayout.paddingLayout(4)
     ).withName("VkImageMemoryBarrier");
 
+    /** The path this driver gets: a shared image, or a shared buffer on dzn. */
+    private static final int IMAGE_LAYOUT_GENERAL = 1;
+
     @Test
     void clearsPresentsAndResizesThroughDxgi() {
+        run(DxgiContext::create);
+    }
+
+    /** The buffer path on whatever driver this is, so it is exercised on one that would not choose it. */
+    @Test
+    void clearsPresentsAndResizesThroughASharedBuffer() {
+        run((instance, device) -> DxgiContext.create(instance, device, true));
+    }
+
+    private static void run(BiFunction<VulkanInstance, VulkanDevice, DxgiContext> contexts) {
         assumeTrue(System.getProperty("os.name", "").startsWith("Windows"), "DXGI is Windows only");
         try (VulkanInstance instance = new VulkanInstance("dxgi-bridge smoke", List.of())) {
             Optional<VulkanInstance.DeviceSelection> selection = instance.selectGraphicsDevice();
@@ -60,7 +74,7 @@ class DxgiSmokeTest {
                     .withTimelineSemaphore();
             MemorySegment hwnd = TestWindow.create(640, 480);
             try (VulkanDevice device = new VulkanDevice(instance.handle(), selection.get(), request);
-                 DxgiContext context = DxgiContext.create(instance, device)) {
+                 DxgiContext context = contexts.apply(instance, device)) {
                 Clearer clearer = new Clearer(device);
                 try (DxgiSwapchain swapchain = DxgiSwapchain.create(context, hwnd, 640, 480)) {
                     int w = 640;
@@ -74,8 +88,7 @@ class DxgiSmokeTest {
                         }
                         swapchain.beginFrame(1000);
                         long rendered = context.nextValue();
-                        clearer.clear(swapchain.image().image(), context.timelineSemaphore(),
-                                swapchain.lastCopyValue(), rendered, frame / 6f);
+                        clearer.clear(swapchain, w, h, context.timelineSemaphore(), rendered, frame / 6f);
                         swapchain.present(rendered, w, h);
                     }
                     assertEquals(900, swapchain.width());
@@ -95,7 +108,7 @@ class DxgiSmokeTest {
     }
 
     /** Clears the shared image to a colour in Vulkan, waiting on and signalling the shared timeline. */
-    private static final class Clearer implements AutoCloseable {
+    static final class Clearer implements AutoCloseable {
         private final VulkanDevice device;
         private final MethodHandle createPool;
         private final MethodHandle destroyPool;
@@ -142,7 +155,13 @@ class DxgiSmokeTest {
             }
         }
 
-        void clear(long image, long timeline, long waitValue, long signalValue, float shade) {
+        /**
+         * Clear {@code swapchain}'s image in {@code GENERAL} (a layout a copy can read, for
+         * {@link DxgiSwapchain#recordCopyOut}) and hand its {@code w}×{@code h} corner on.
+         */
+        void clear(DxgiSwapchain swapchain, int w, int h, long timeline, long signalValue, float shade) {
+            long image = swapchain.image().image();
+            long waitValue = swapchain.lastCopyValue();
             try (Arena temp = Arena.ofConfined()) {
                 MemorySegment beginInfo = temp.allocate(VkStructs.COMMAND_BUFFER_BEGIN_INFO);
                 Ffm.si(beginInfo, VkStructs.COMMAND_BUFFER_BEGIN_INFO, "sType", Vk.STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
@@ -153,7 +172,7 @@ class DxgiSmokeTest {
                 Ffm.si(b, IMAGE_MEMORY_BARRIER, "sType", Vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
                 Ffm.si(b, IMAGE_MEMORY_BARRIER, "dstAccessMask", Vk.ACCESS_TRANSFER_WRITE_BIT);
                 Ffm.si(b, IMAGE_MEMORY_BARRIER, "oldLayout", Vk.IMAGE_LAYOUT_UNDEFINED);
-                Ffm.si(b, IMAGE_MEMORY_BARRIER, "newLayout", Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                Ffm.si(b, IMAGE_MEMORY_BARRIER, "newLayout", IMAGE_LAYOUT_GENERAL);
                 Ffm.si(b, IMAGE_MEMORY_BARRIER, "srcQueueFamilyIndex", Vk.QUEUE_FAMILY_IGNORED);
                 Ffm.si(b, IMAGE_MEMORY_BARRIER, "dstQueueFamilyIndex", Vk.QUEUE_FAMILY_IGNORED);
                 Ffm.sl(b, IMAGE_MEMORY_BARRIER, "image", image);
@@ -172,7 +191,9 @@ class DxgiSmokeTest {
                 range.setAtIndex(JAVA_INT, 0, Vk.IMAGE_ASPECT_COLOR_BIT);
                 range.setAtIndex(JAVA_INT, 2, 1);
                 range.setAtIndex(JAVA_INT, 4, 1);
-                Ffm.invokeVoid(clear, cmd, image, Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, color, 1, range);
+                Ffm.invokeVoid(clear, cmd, image, IMAGE_LAYOUT_GENERAL, color, 1, range);
+                swapchain.recordCopyOut(cmd, IMAGE_LAYOUT_GENERAL, Vk.PIPELINE_STAGE_TRANSFER_BIT,
+                        Vk.ACCESS_TRANSFER_WRITE_BIT, w, h);
                 Ffm.check(Ffm.invoke(end, cmd), "vkEndCommandBuffer");
 
                 MemorySegment waitValues = temp.allocate(JAVA_LONG);
@@ -216,7 +237,7 @@ class DxgiSmokeTest {
     }
 
     /** A hidden top-level window of the predefined {@code STATIC} class: an HWND to present to and nothing else. */
-    private static final class TestWindow {
+    static final class TestWindow {
         private static final SymbolLookup USER32 = Ffi.library("user32");
         private static final MethodHandle CreateWindowExW = Ffi.downcall(USER32, "CreateWindowExW",
                 FunctionDescriptor.of(ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
