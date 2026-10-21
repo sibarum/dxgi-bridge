@@ -2,6 +2,8 @@
 
 Present Vulkan-drawn images through a **DXGI swapchain** on Windows, from Java, over Panama FFM.
 
+Part of the [VexelRay](https://sibarum.github.io/) stack. Building an application on it? Start at the [developer guide](https://sibarum.github.io/vexelray-framework/developers/).
+
 Vulkan keeps doing all the drawing. It draws into one image that D3D12 created and shared; a D3D12 queue copies
 the visible part of it into a flip-model DXGI swapchain and presents. The swapchain's back buffers, like the image,
 are larger than the window and presented unscaled, so a window resize normally reallocates nothing: neither a
