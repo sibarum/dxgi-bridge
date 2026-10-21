@@ -34,6 +34,13 @@
             <artifactId>vastir-vulkan</artifactId>
             <version>${supirvast.version}</version>
         </dependency>
+        <!-- And vastir-vulkan's: where the Vulkan loader is. This module is Windows-only, so no OS profile picks it. -->
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir-vulkan-windows</artifactId>
+            <version>${supirvast.version}</version>
+            <scope>runtime</scope>
+        </dependency>
 
         <dependency>
             <groupId>org.junit.jupiter</groupId>
