@@ -51,10 +51,15 @@
                 <groupId>dev.vexelray.build</groupId>
                 <artifactId>vexelray-build-maven-plugin</artifactId>
                 <version>0.1.2-SNAPSHOT</version>
+                <!-- This module is one OS's by nature: its platform-specific code is where it belongs. -->
+                <configuration>
+                    <os>windows</os>
+                </configuration>
                 <executions>
                     <execution>
                         <goals>
                             <goal>identify</goal>
+                            <goal>isolate</goal>
                         </goals>
                     </execution>
                 </executions>
